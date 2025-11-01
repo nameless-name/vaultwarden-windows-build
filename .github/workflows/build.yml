@@ -1,0 +1,133 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_choice:
+        description: "版本选择"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - latest
+          - custom
+      tag:
+        description: "自定义 commit"
+        required: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查工具版本
+        run: git version && cargo --version && vcpkg version
+
+      - name: vaultwarden 版本选择
+        id: get_tag
+        run: |
+          if ("${{ github.event.inputs.tag_choice }}" -eq "release") {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest"
+            echo "Using release tag: $($release.tag_name)"
+            echo "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
+          } elseif ("${{ github.event.inputs.tag_choice }}" -eq "latest") {
+            echo "Using latest commit"
+            echo "tag=" >> $env:GITHUB_OUTPUT
+          } elseif ("${{ github.event.inputs.tag_choice }}" -eq "custom") {
+            echo "Using custom tag: ${{ github.event.inputs.tag }}"
+            echo "tag=${{ github.event.inputs.tag }}" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: 克隆 vaultwarden 仓库
+        run: git clone https://github.com/dani-garcia/vaultwarden
+
+      - name: 切换版本
+        if: ${{ steps.get_tag.outputs.tag != '' }}
+        run: git switch --detach "${{ steps.get_tag.outputs.tag }}"
+        working-directory: vaultwarden
+
+      - name: 下载 web-vault
+        run: |
+          $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest"
+          $Asset = $Release.assets | Where-Object { $_.name -like "*.tar.gz" }
+
+          if (-not $Asset) {
+            Write-Error "No .tar.gz asset found."
+            exit 1
+          }
+
+          $DownloadUrl = $Asset.browser_download_url
+          $FileName = $Asset.name
+          $OutPath = "web-vault"
+
+          Write-Host "Downloading $FileName..."
+          Invoke-WebRequest -Uri $DownloadUrl -OutFile $FileName
+
+          Write-Host "Extracting..."
+          tar -xf $FileName
+
+      - name: 配置 vcpkg 缓存
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: 使用 vcpkg 安装依赖
+        run: |
+          vcpkg integrate install
+          vcpkg install openssl:x64-windows-static
+        env:
+          VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+      - name: 编译 vaultwarden
+        run: cargo build --features sqlite --release
+        working-directory: vaultwarden
+        env:
+          RUSTFLAGS: "-Ctarget-feature=+crt-static"
+
+      - name: 移动文件
+        run: move .\vaultwarden\target\release\vaultwarden.exe .\vaultwarden.exe
+
+      - name: 版本信息
+        id: get_version
+        run: |
+          $version_output = .\vaultwarden.exe -v
+          $vaultwarden_version = ($version_output | Select-String -Pattern "Vaultwarden (\S+)").Matches.Groups[1].Value
+          $web_vault_version = ($version_output | Select-String -Pattern "Web-Vault (\S+)").Matches.Groups[1].Value
+
+          echo "vaultwarden_version=$vaultwarden_version" >> $env:GITHUB_OUTPUT
+          echo "web_vault_version=$web_vault_version" >> $env:GITHUB_OUTPUT
+
+      - name: 获取当前时间
+        id: build_time
+        run: |
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          echo "timestamp=$timestamp" >> $env:GITHUB_OUTPUT
+
+      - name: 创建打包目录
+        run: |
+          mkdir build_output
+          move vaultwarden.exe build_output/
+          move web-vault build_output/
+
+      - name: 创建压缩包
+        run: |
+          Compress-Archive -Path build_output/* -DestinationPath Vaultwarden_${{ steps.get_version.outputs.vaultwarden_version }}_${{ steps.get_version.outputs.web_vault_version }}_${{ steps.build_time.outputs.timestamp }}.zip
+
+      - name: 拷贝压缩包到仓库目录
+        run: |
+          mkdir builds -Force
+          move Vaultwarden_*.zip builds/
+
+      - name: 提交并推送构建文件
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull
+          git add builds/*
+          git commit -m "Vaultwarden ${{ steps.get_version.outputs.vaultwarden_version }} - Web-Vault ${{ steps.get_version.outputs.web_vault_version }} - ${{ steps.build_time.outputs.timestamp }}" || echo "No changes to commit."
+          git push origin HEAD:${{ github.ref }}
